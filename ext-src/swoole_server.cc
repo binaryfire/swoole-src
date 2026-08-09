@@ -89,6 +89,7 @@ static TaskId php_swoole_server_task_pack(zval *data, EventData *task);
 static bool php_swoole_server_task_unpack(zval *zresult, EventData *task_result);
 static int php_swoole_server_dispatch_func(Server *serv, Connection *conn, SendData *data);
 static zval *php_swoole_server_add_port(ServerObject *server_object, ListenPort *port);
+static void php_swoole_connection_iterator_deref(zend_object *object);
 
 void php_swoole_server_rshutdown() {
     if (!sw_server() || !sw_worker()) {
@@ -219,9 +220,13 @@ static void server_free_object(zend_object *object) {
         for (auto &user_processe : property->user_processes) {
             sw_zval_free(user_processe);
         }
+        for (auto connection_iterator : property->connection_iterators) {
+            php_swoole_connection_iterator_deref(connection_iterator);
+            OBJ_RELEASE(connection_iterator);
+        }
         for (auto zport : property->ports) {
             php_swoole_server_port_deref(Z_OBJ_P(zport));
-            efree(zport);
+            sw_zval_free(zport);
         }
         server_object->serv = nullptr;
     }
@@ -264,6 +269,12 @@ static sw_inline ConnectionIteratorObject *php_swoole_connection_iterator_fetch_
 
 static sw_inline ConnectionIterator *php_swoole_connection_iterator_get_ptr(zval *zobject) {
     return &php_swoole_connection_iterator_fetch_object(Z_OBJ_P(zobject))->iterator;
+}
+
+static void php_swoole_connection_iterator_deref(zend_object *object) {
+    ConnectionIterator *iterator = &php_swoole_connection_iterator_fetch_object(object)->iterator;
+    iterator->serv = nullptr;
+    iterator->port = nullptr;
 }
 
 ConnectionIterator *php_swoole_connection_iterator_get_and_check_ptr(zval *zobject) {
@@ -815,6 +826,7 @@ static zval *php_swoole_server_add_port(ServerObject *server_object, ListenPort 
     do {
         zval *zserv = php_swoole_server_zval_ptr(serv);
         zval *zports = sw_zend_read_and_convert_property_array(Z_OBJCE_P(zserv), zserv, ZEND_STRL("ports"), 0);
+        Z_ADDREF_P(zport);
         (void) add_next_index_zval(zports, zport);
     } while (false);
 
@@ -826,6 +838,8 @@ static zval *php_swoole_server_add_port(ServerObject *server_object, ListenPort 
         ConnectionIterator *iterator = php_swoole_connection_iterator_get_ptr(&connection_iterator);
         iterator->serv = serv;
         iterator->port = port;
+        GC_ADDREF(Z_OBJ(connection_iterator));
+        server_object->property->connection_iterators.push_back(Z_OBJ(connection_iterator));
 
         zend_update_property(swoole_server_port_ce, SW_Z8_OBJ_P(zport), ZEND_STRL("connections"), &connection_iterator);
         zval_ptr_dtor(&connection_iterator);
@@ -1947,6 +1961,8 @@ static void server_ctor(zval *zserv, Server *serv) {
 
         ConnectionIterator *iterator = php_swoole_connection_iterator_get_ptr(&connection_iterator);
         iterator->serv = serv;
+        GC_ADDREF(Z_OBJ(connection_iterator));
+        server_object->property->connection_iterators.push_back(Z_OBJ(connection_iterator));
 
         zend_update_property(swoole_server_ce, SW_Z8_OBJ_P(zserv), ZEND_STRL("connections"), &connection_iterator);
         zval_ptr_dtor(&connection_iterator);
@@ -2799,13 +2815,14 @@ static PHP_METHOD(swoole_server, start) {
             zval_ptr_dtor(&_thread_argv);
         }
 
-        serv->worker_thread_start = [bootstrap, thread_argv](std::shared_ptr<Thread> thread, const WorkerFn &fn) {
+        serv->worker_thread_start =
+            [bootstrap, thread_argv](std::shared_ptr<Thread> thread, const WorkerFn &fn, const WorkerFn &cleanup) {
             worker_thread_fn = fn;
             zend_string *bootstrap_copy = zend_string_dup(bootstrap, true);
             if (thread_argv) {
                 thread_argv->add_ref();
             }
-            php_swoole_thread_start(thread, bootstrap_copy, thread_argv);
+            php_swoole_thread_start(thread, bootstrap_copy, thread_argv, cleanup);
         };
 
         // The runtime hook must be enabled before creating child threads.
@@ -3930,6 +3947,10 @@ static PHP_METHOD(swoole_connection_iterator, rewind) {
 
 static PHP_METHOD(swoole_connection_iterator, valid) {
     ConnectionIterator *iterator = php_swoole_connection_iterator_get_and_check_ptr(ZEND_THIS);
+    // The connection table only exists while the server is running.
+    if (!iterator->serv->is_started()) {
+        RETURN_FALSE;
+    }
     int fd = iterator->current_fd;
     int max_fd = iterator->serv->get_maxfd();
 

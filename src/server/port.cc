@@ -830,6 +830,9 @@ const char *ListenPort::get_protocols() const {
 }
 
 size_t ListenPort::get_connection_num() const {
+    if (gs == nullptr) {
+        return 0;
+    }
     if (gs->connection_nums) {
         size_t num = 0;
         for (uint32_t i = 0; i < sw_server()->worker_num; i++) {
