@@ -66,9 +66,21 @@ int Server::start_manager_process() {
     auto fn = [this]() {
         gs->manager_pid = getpid();
 
+        auto abort_manager_start = [this]() {
+            gs->manager_start_failed = 1;
+            factory_->kill_event_workers();
+            factory_->kill_task_workers();
+            factory_->kill_user_workers();
+            if (is_process_mode()) {
+                // The master may release shared state after this barrier, so workers must be reaped first.
+                gs->manager_barrier.wait();
+            }
+        };
+
         if (task_worker_num > 0) {
             if (get_task_worker_pool()->start() == SW_ERR) {
-                swoole_sys_error("failed to start task worker");
+                swoole_warning("failed to start task worker");
+                abort_manager_start();
                 return;
             }
         }
@@ -83,7 +95,8 @@ int Server::start_manager_process() {
         SW_LOOP_N(worker_num) {
             Worker *worker = get_worker(i);
             if (factory_->spawn_event_worker(worker) < 0) {
-                swoole_sys_error("failed to fork event worker");
+                swoole_sys_warning("failed to fork event worker");
+                abort_manager_start();
                 return;
             }
         }
@@ -91,7 +104,8 @@ int Server::start_manager_process() {
         if (!user_worker_list.empty()) {
             for (auto worker : user_worker_list) {
                 if (factory_->spawn_user_worker(worker) < 0) {
-                    swoole_sys_error("failed to fork user worker");
+                    swoole_sys_warning("failed to fork user worker");
+                    abort_manager_start();
                     return;
                 }
             }
@@ -103,6 +117,9 @@ int Server::start_manager_process() {
 
     if (is_base_mode()) {
         fn();
+        if (gs->manager_start_failed) {
+            return SW_ERR;
+        }
     } else {
         if (swoole_fork_exec(fn) < 0) {
             swoole_sys_warning("failed fork manager process");

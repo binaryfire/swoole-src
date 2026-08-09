@@ -173,6 +173,8 @@ struct ClientInfoSnapshot {
 struct ReactorThread {
     int id;
     std::thread thread;
+    bool initialized = false;
+    bool startup_signalled = false;
     network::Socket *notify_pipe = nullptr;
     uint64_t dispatch_count = 0;
     network::Socket *pipe_command = nullptr;
@@ -509,6 +511,7 @@ struct ListenPort {
     size_t get_connection_num() const;
 };
 
+// ServerGS is allocated in zero-filled shared memory; C++ initializers and constructors do not run.
 struct ServerGS {
     pid_t master_pid;
     pid_t manager_pid;
@@ -520,10 +523,11 @@ struct ServerGS {
     int max_fd;
     int min_fd;
 
-    bool onstart_called;
+    bool start_completed;
+    sw_atomic_t manager_start_failed;
     time_t start_time;
     sw_atomic_t connection_num;
-    sw_atomic_t *connection_nums = nullptr;
+    sw_atomic_t *connection_nums;
     sw_atomic_t tasking_num;
     uint32_t max_concurrency;
     sw_atomic_t concurrency;
@@ -647,7 +651,7 @@ class ThreadFactory : public BaseFactory {
     ~ThreadFactory() override;
     WorkerId get_manager_thread_id() const;
     WorkerId get_master_thread_id() const;
-    void spawn_event_worker(WorkerId i);
+    void spawn_event_worker(WorkerId i, bool startup);
     void spawn_task_worker(WorkerId i);
     void spawn_user_worker(WorkerId i);
     void spawn_manager_thread(WorkerId i);
@@ -1728,7 +1732,7 @@ class Server {
     void worker_accept_event(DataHead *info);
     void worker_signal_init() const;
 
-    std::function<void(std::shared_ptr<Thread>, const WorkerFn &fn)> worker_thread_start;
+    std::function<void(std::shared_ptr<Thread>, const WorkerFn &fn, const WorkerFn &cleanup)> worker_thread_start;
 
     /**
      * [Master]
@@ -1741,7 +1745,8 @@ class Server {
 
     static void worker_signal_handler(int signo);
     static int reactor_process_main_loop(ProcessPool *pool, Worker *worker);
-    static void reactor_thread_main_loop(Server *serv, int reactor_id);
+    static void reactor_thread_main_loop(Server *serv, int reactor_id, bool startup);
+    void arrive_at_startup_barrier(ReactorThread *thread, bool failed);
     static bool task_pack(EventData *task, const void *data, size_t data_len);
     static void task_dump(EventData *task);
     static bool task_unpack(EventData *task, String *buffer, PacketPtr *packet);
@@ -1767,6 +1772,7 @@ class Server {
     uint32_t max_connection = 0;
     TimerNode *enable_accept_timer = nullptr;
     std::thread heartbeat_thread;
+    std::atomic_bool reactor_thread_init_failed{false};
     /**
      * The number of pipe per reactor maintenance
      */
@@ -1794,7 +1800,7 @@ class Server {
     void store_pipe_fd(UnixSocket *p);
 #endif
     void destroy_base_factory();
-    void destroy_thread_factory() const;
+    void destroy_thread_factory();
 #ifndef _WIN32
     void destroy_process_factory();
 #endif
@@ -1806,6 +1812,7 @@ class Server {
 #endif
     int start_worker_threads();
     int start_master_thread(Reactor *reactor);
+    int abort_start();
     void start_heartbeat_thread();
     void stop_worker_threads();
     bool reload_worker_threads(bool reload_all_workers) const;

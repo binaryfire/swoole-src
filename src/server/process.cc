@@ -22,10 +22,6 @@ using network::Socket;
 
 Factory *Server::create_process_factory() {
     /**
-     * init reactor thread pool
-     */
-    reactor_threads = new ReactorThread[reactor_num]();
-    /**
      * alloc the memory for connection_list
      */
     connection_list = static_cast<Connection *>(sw_shm_calloc(max_connection, sizeof(Connection)));
@@ -33,6 +29,10 @@ Factory *Server::create_process_factory() {
         swoole_sys_warning("sw_shm_calloc(%u, %zu) for connection_list failed", max_connection, sizeof(Connection));
         return nullptr;
     }
+    /**
+     * init reactor thread pool
+     */
+    reactor_threads = new ReactorThread[reactor_num]();
     reactor_pipe_num = worker_num / reactor_num;
 
     reactor_thread_barrier.init(false, reactor_num + 1);
@@ -43,7 +43,9 @@ Factory *Server::create_process_factory() {
 
 void Server::destroy_process_factory() {
     sw_shm_free(connection_list);
+    connection_list = nullptr;
     delete[] reactor_threads;
+    reactor_threads = nullptr;
 
     reactor_thread_barrier.destroy();
     gs->manager_barrier.destroy();
@@ -87,11 +89,18 @@ void Factory::kill_event_workers() const {
         return;
     }
 
+    // A zero pid would signal the entire process group while unwinding a partial spawn.
     SW_LOOP_N(server_->worker_num) {
+        if (server_->workers[i].pid <= 0) {
+            continue;
+        }
         swoole_trace_log(SW_TRACE_SERVER, "kill worker#%d[pid=%d]", server_->workers[i].id, server_->workers[i].pid);
         swoole_kill(server_->workers[i].pid, SIGTERM);
     }
     SW_LOOP_N(server_->worker_num) {
+        if (server_->workers[i].pid <= 0) {
+            continue;
+        }
         swoole_trace_log(SW_TRACE_SERVER, "wait worker#%d[pid=%d]", server_->workers[i].id, server_->workers[i].pid);
         if (swoole_waitpid(server_->workers[i].pid, &status, 0) < 0) {
             swoole_sys_warning("waitpid(%d) failed", server_->workers[i].pid);
@@ -112,6 +121,9 @@ void Factory::kill_task_workers() const {
     pool->kill_all_workers(SIGTERM);
 
     SW_LOOP_N(server_->task_worker_num) {
+        if (pool->workers[i].pid <= 0) {
+            continue;
+        }
         swoole_trace_log(SW_TRACE_SERVER, "wait worker#%d[pid=%d]", pool->workers[i].id, pool->workers[i].pid);
         if (swoole_waitpid(pool->workers[i].pid, &status, 0) < 0) {
             swoole_sys_warning("waitpid(%d) failed", pool->workers[i].pid);
