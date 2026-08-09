@@ -64,8 +64,23 @@ try {
 
 $server = new Server('127.0.0.1', 0, SWOOLE_BASE);
 Assert::isInstanceOf($server, Server::class);
+Assert::same(count($server->connections), 0);
+Assert::same(count($server->ports[0]->connections), 0);
+Assert::same(iterator_to_array($server->connections), []);
+Assert::same(iterator_to_array($server->ports[0]->connections), []);
+
+$serverConnections = $server->connections;
+$portConnections = $server->ports[0]->connections;
+$server->connections = null;
+$server->ports[0]->connections = null;
+$server->ports = [];
 
 unset($server);
+gc_collect_cycles();
+
+Assert::isInstanceOf($serverConnections, Swoole\Connection\Iterator::class);
+Assert::isInstanceOf($portConnections, Swoole\Connection\Iterator::class);
+unset($serverConnections, $portConnections);
 gc_collect_cycles();
 
 $server = new Server('127.0.0.1', 0, SWOOLE_BASE);
@@ -78,6 +93,19 @@ $fd_count = open_fd_count();
 if ($fd_count !== null) {
     for ($i = 0; $i < 3; $i++) {
         $server = new Server('127.0.0.1', 0, SWOOLE_BASE);
+        unset($server);
+        gc_collect_cycles();
+
+        Assert::same(open_fd_count(), $fd_count);
+    }
+
+    for ($i = 0; $i < 3; $i++) {
+        $server = new Server('127.0.0.1', 0, SWOOLE_PROCESS);
+        Assert::true($server->addCommand(
+            'test',
+            SWOOLE_SERVER_COMMAND_MASTER,
+            static fn (Server $server, string $message): string => ''
+        ));
         unset($server);
         gc_collect_cycles();
 
