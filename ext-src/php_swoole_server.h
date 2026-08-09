@@ -81,6 +81,7 @@ struct ServerPortProperty {
 
 struct ServerProperty {
     std::vector<zval *> ports;
+    std::vector<zend_object *> connection_iterators;
     std::vector<zval *> user_processes;
     zend::Callable *callbacks[PHP_SWOOLE_SERVER_CALLBACK_NUM];
     std::unordered_map<TaskId, zend::Callable *> task_callbacks;
