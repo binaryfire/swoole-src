@@ -710,7 +710,7 @@ void Server::heartbeat_check(Timer *timer, TimerNode *tnode) {
  */
 int Server::start_reactor_threads() {
     if (swoole_event_init(0) < 0) {
-        return SW_ERR;
+        return abort_start();
     }
 
     Reactor *reactor = sw_reactor();
@@ -720,16 +720,19 @@ int Server::start_reactor_threads() {
             continue;
         }
         if (port->listen() < 0) {
-            swoole_event_free();
-            return SW_ERR;
+            return abort_start();
         }
-        reactor->add(port->socket, SW_EVENT_READ);
+        if (reactor->add(port->socket, SW_EVENT_READ) < 0) {
+            return abort_start();
+        }
     }
 
     store_listen_socket();
 
     if (single_thread) {
-        get_thread(0)->init(this, reactor, 0);
+        if (get_thread(0)->init(this, reactor, 0) < 0) {
+            return abort_start();
+        }
         goto _init_master_thread;
     }
     /**
@@ -746,7 +749,7 @@ int Server::start_reactor_threads() {
     SW_LOOP_N(reactor_num) {
         get_thread(i)->thread = std::thread([=]() {
             swoole_thread_init(false);
-            reactor_thread_main_loop(this, i);
+            reactor_thread_main_loop(this, i, true);
             swoole_thread_clean(false);
         });
     }
@@ -759,6 +762,9 @@ _init_master_thread:
     if (heartbeat_check_interval >= 1) {
         if (single_thread) {
             heartbeat_timer = swoole_timer_add(sec2msec(heartbeat_check_interval), true, heartbeat_check, reactor);
+            if (heartbeat_timer == nullptr) {
+                return abort_start();
+            }
         } else {
             start_heartbeat_thread();
         }
@@ -777,6 +783,9 @@ int ReactorThread::init(Server *serv, Reactor *reactor, uint16_t reactor_id) {
 
     reactor->set_handler(SW_FD_PIPE, SW_EVENT_READ, ReactorThread_onPipeRead);
     reactor->set_handler(SW_FD_PIPE, SW_EVENT_WRITE, ReactorThread_onPipeWrite);
+
+    serv->init_reactor(reactor);
+    serv->init_pipe_sockets(&message_bus);
 
     // listen UDP port
     if (serv->have_dgram_sock == 1) {
@@ -799,18 +808,20 @@ int ReactorThread::init(Server *serv, Reactor *reactor, uint16_t reactor_id) {
         }
     }
 
-    serv->init_reactor(reactor);
-    serv->init_pipe_sockets(&message_bus);
-
     if (serv->is_thread_mode()) {
         Worker *worker = serv->get_worker(reactor_id);
         serv->init_event_worker(worker);
         auto pipe_worker = message_bus.get_pipe_socket(worker->pipe_worker);
-        reactor->add(pipe_worker, SW_EVENT_READ);
+        if (reactor->add(pipe_worker, SW_EVENT_READ) < 0) {
+            return SW_ERR;
+        }
 
         if (serv->heartbeat_check_interval > 0) {
             heartbeat_timer =
                 swoole_timer_add(sec2msec(serv->heartbeat_check_interval), true, Server::heartbeat_check, reactor);
+            if (heartbeat_timer == nullptr) {
+                return SW_ERR;
+            }
         }
     }
 
@@ -849,34 +860,60 @@ int ReactorThread::init(Server *serv, Reactor *reactor, uint16_t reactor_id) {
 }
 
 void ReactorThread::clean() {
+    message_bus.clear();
     message_bus.free_buffer();
+    message_bus.release_pipe_sockets();
+    pipe_command = nullptr;
 }
 
-void Server::reactor_thread_main_loop(Server *serv, int reactor_id) {
+void Server::arrive_at_startup_barrier(ReactorThread *thread, bool failed) {
+    if (failed) {
+        reactor_thread_init_failed = true;
+    }
+    thread->startup_signalled = true;
+    reactor_thread_barrier.wait();
+}
+
+void Server::reactor_thread_main_loop(Server *serv, int reactor_id, bool startup) {
     ReactorThread *thread = serv->get_thread(reactor_id);
     thread->id = reactor_id;
     SwooleTG.message_bus = &thread->message_bus;
 
+    bool init_failed = false;
+    bool worker_started = false;
     if (swoole_event_init(0) < 0) {
-        return;
-    }
-
-    if (serv->is_thread_mode()) {
-        serv->call_worker_start_callback(serv->get_worker(reactor_id));
+        init_failed = true;
     } else {
-        swoole_set_thread_id(reactor_id);
-        swoole_set_thread_type(Server::THREAD_REACTOR);
+        if (serv->is_thread_mode()) {
+            serv->call_worker_start_callback(serv->get_worker(reactor_id));
+            worker_started = true;
+        } else {
+            swoole_set_thread_id(reactor_id);
+            swoole_set_thread_type(Server::THREAD_REACTOR);
+        }
+
+        Reactor *reactor = sw_reactor();
+        if (thread->init(serv, reactor, reactor_id) < 0) {
+            swoole_event_free();
+            init_failed = true;
+        }
     }
 
-    Reactor *reactor = sw_reactor();
-    if (thread->init(serv, reactor, reactor_id) < 0) {
-        swoole_event_free();
+    if (init_failed) {
+        if (worker_started) {
+            serv->call_worker_stop_callback(serv->get_worker(reactor_id));
+        }
+        thread->clean();
+        if (startup) {
+            serv->arrive_at_startup_barrier(thread, true);
+        }
         return;
     }
 
-    // wait other thread
-    if (serv->is_process_mode()) {
-        serv->reactor_thread_barrier.wait();
+    thread->initialized = true;
+    if (startup) {
+        // Only the initial worker generation participates in the server startup rendezvous.
+        serv->arrive_at_startup_barrier(thread, false);
     }
     // main loop
     swoole_event_wait();
@@ -964,6 +1001,8 @@ void Server::join_heartbeat_thread() {
 
 void Server::join_reactor_thread() {
     if (single_thread) {
+        // The single-thread reactor runs on the master thread, so nothing else ever reaches ReactorThread::clean().
+        get_thread(0)->clean();
         return;
     }
 
