@@ -503,8 +503,10 @@ static void thread_register_stdio_file_handles(bool no_close) {
     zend_register_constant(&ec);
 }
 
-void php_swoole_thread_start(
-    std::shared_ptr<Thread> thread, zend_string *file, ZendArray *argv, const std::function<void()> &cleanup) {
+void php_swoole_thread_start(std::shared_ptr<Thread> thread,
+                             zend_string *file,
+                             ZendArray *argv,
+                             const std::function<void()> &cleanup) {
     thread_num.fetch_add(1);
     thread->enter();
     ts_resource(0);

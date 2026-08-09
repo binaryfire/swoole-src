@@ -2799,8 +2799,8 @@ static PHP_METHOD(swoole_server, start) {
             zval_ptr_dtor(&_thread_argv);
         }
 
-        serv->worker_thread_start =
-            [bootstrap, thread_argv](std::shared_ptr<Thread> thread, const WorkerFn &fn, const WorkerFn &cleanup) {
+        serv->worker_thread_start = [bootstrap, thread_argv](
+                                        std::shared_ptr<Thread> thread, const WorkerFn &fn, const WorkerFn &cleanup) {
             worker_thread_fn = fn;
             zend_string *bootstrap_copy = zend_string_dup(bootstrap, true);
             if (thread_argv) {
