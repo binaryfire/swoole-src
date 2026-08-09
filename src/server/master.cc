@@ -467,25 +467,32 @@ int Server::start_master_thread(Reactor *reactor) {
     reactor->ptr = this;
     reactor->set_handler(SW_FD_STREAM_SERVER, SW_EVENT_READ, accept_connection);
 
+    if (is_thread_mode() || !single_thread) {
+        reactor_thread_barrier.wait();
+    }
+    if (is_process_mode() || is_thread_mode()) {
+        gs->manager_barrier.wait();
+    }
+    gs->master_pid = getpid();
+
+    if (reactor_thread_init_failed.load() || gs->manager_start_failed) {
+        return abort_start();
+    }
+
     if (pipe_command) {
         if (!single_thread) {
             reactor->set_handler(SW_FD_PIPE, SW_EVENT_READ, accept_command_result);
         }
-        reactor->add(pipe_command->get_socket(true), SW_EVENT_READ);
+        if (reactor->add(pipe_command->get_socket(true), SW_EVENT_READ) < 0) {
+            return abort_start();
+        }
     }
 
     if ((master_timer = swoole_timer_add(1000L, true, Server::timer_callback, this)) == nullptr) {
-        swoole_event_free();
-        return SW_ERR;
+        return abort_start();
     }
 
-    if (!single_thread && !is_thread_mode()) {
-        reactor_thread_barrier.wait();
-    }
-    if (is_process_mode()) {
-        gs->manager_barrier.wait();
-    }
-    gs->master_pid = getpid();
+    gs->start_completed = true;
 
     if (isset_hook(HOOK_MASTER_START)) {
         call_hook(HOOK_MASTER_START, this);
@@ -496,6 +503,24 @@ int Server::start_master_thread(Reactor *reactor) {
     }
 
     return swoole_event_wait();
+}
+
+int Server::abort_start() {
+    // Before the master records its pid, the manager may still be waiting for permission to release shared state.
+    if (is_process_mode() && gs->master_pid == 0) {
+        gs->manager_barrier.wait();
+    }
+    // Mark the barrier boundary before destroy() can release resources shared with the manager.
+    gs->master_pid = getpid();
+    running = false;
+
+    if (swoole_event_is_available()) {
+        stop_master_thread();
+        swoole_event_free();
+    }
+
+    destroy();
+    return SW_ERR;
 }
 
 void Server::store_listen_socket() {
@@ -549,7 +574,7 @@ bool Server::create_task_workers() {
 
     if (ipc_mode == SW_IPC_SOCKET) {
         char sockfile[sizeof(struct sockaddr_un)];
-        snprintf(sockfile, sizeof(sockfile), "/tmp/swoole.task.%d.sock", gs->master_pid);
+        snprintf(sockfile, sizeof(sockfile), "/tmp/swoole.task.%d.sock", getpid());
         if (get_task_worker_pool()->listen(sockfile, 2048) < 0) {
             cleanup();
             return false;
@@ -672,6 +697,9 @@ int Server::start() {
         }
 
         if (swoole_daemon(0, 1) < 0) {
+            gs->start = 0;
+            running = false;
+            destroy();
             return SW_ERR;
         }
     }
@@ -704,6 +732,10 @@ int Server::start() {
     running = true;
     // factory start
     if (!factory_->start()) {
+        // A factory that never started must not enter its runtime shutdown path.
+        gs->start = 0;
+        running = false;
+        destroy();
         return SW_ERR;
     }
     // write PID file
@@ -722,16 +754,12 @@ int Server::start() {
         abort();
         return SW_ERR;
     }
-    // failed to start
-    if (ret < 0) {
-        return SW_ERR;
-    }
     destroy();
     // remove PID file
     if (!pid_file.empty()) {
         unlink(pid_file.c_str());
     }
-    return SW_OK;
+    return ret < 0 ? SW_ERR : SW_OK;
 }
 
 /**
@@ -762,7 +790,12 @@ Server::Server(Mode _mode) {
     message_bus.set_id_generator(msg_id_generator);
 
 #ifdef SW_THREAD
-    worker_thread_start = [](std::shared_ptr<Thread>, const WorkerFn &fn) { fn(); };
+    worker_thread_start = [](std::shared_ptr<Thread>, const WorkerFn &fn, const WorkerFn &cleanup) {
+        ON_SCOPE_EXIT {
+            cleanup();
+        };
+        fn();
+    };
 #endif
 
     SwooleG.server = this;
@@ -772,6 +805,9 @@ Server::~Server() {
     if (!is_shutdown() && getpid() == gs->master_pid) {
         destroy();
     }
+    // Reactor threads may retain duplicate wrappers for this pipe until destroy() joins them.
+    // By this point destroy() has run, either from start() or from the block above.
+    delete pipe_command;
     if (SwooleG.server == this) {
         SwooleG.server = nullptr;
     }
@@ -842,17 +878,48 @@ int Server::create() {
         return SW_ERR;
     }
 
+    auto cleanup = [this]() {
+        if (factory_) {
+            // Base factory cleanup reads ListenPort::gs, so it must run before those pointers are cleared.
+            if (is_base_mode()) {
+                destroy_base_factory();
+            } else if (is_thread_mode()) {
+                destroy_thread_factory();
+            } else {
+                destroy_process_factory();
+            }
+            delete factory_;
+            factory_ = nullptr;
+        }
+        if (workers) {
+            sw_shm_free(workers);
+            workers = nullptr;
+        }
+        for (auto port : ports) {
+            port->gs = nullptr;
+        }
+        if (port_gs_list) {
+            sw_shm_free(port_gs_list);
+            port_gs_list = nullptr;
+        }
+        if (session_list) {
+            sw_shm_free(session_list);
+            session_list = nullptr;
+        }
+        return SW_ERR;
+    };
+
     session_list = static_cast<Session *>(sw_shm_calloc(SW_SESSION_LIST_SIZE, sizeof(Session)));
     if (session_list == nullptr) {
         swoole_sys_warning("sw_shm_calloc(%d, %zu) for session_list failed", SW_SESSION_LIST_SIZE, sizeof(Session));
-        return SW_ERR;
+        return cleanup();
     }
 
     port_gs_list = static_cast<ServerPortGS *>(sw_shm_calloc(ports.size(), sizeof(ServerPortGS)));
     if (port_gs_list == nullptr) {
         swoole_sys_warning(
             "sw_shm_calloc(%zu, %zu) for port_connection_num_array failed", ports.size(), sizeof(ServerPortGS));
-        return SW_ERR;
+        return cleanup();
     }
 
     int index = 0;
@@ -911,7 +978,7 @@ int Server::create() {
     workers = static_cast<Worker *>(sw_shm_calloc(worker_num, sizeof(Worker)));
     if (workers == nullptr) {
         swoole_sys_warning("sw_shm_calloc(%d, %zu) for workers failed", worker_num, sizeof(Worker));
-        return SW_ERR;
+        return cleanup();
     }
 
     if (is_base_mode()) {
@@ -922,11 +989,11 @@ int Server::create() {
         factory_ = create_process_factory();
     }
     if (!factory_) {
-        return SW_ERR;
+        return cleanup();
     }
 
     if (task_worker_num > 0 && !create_task_workers()) {
-        return SW_ERR;
+        return cleanup();
     }
 
     if (swoole_isset_hook(SW_GLOBAL_HOOK_AFTER_SERVER_CREATE)) {
@@ -1027,7 +1094,7 @@ void Server::stop_master_thread() {
             reactor->del(port->socket);
         }
     }
-    if (pipe_command) {
+    if (pipe_command && !pipe_command->get_socket(true)->removed) {
         reactor->del(pipe_command->get_socket(true));
     }
     clear_timer();
@@ -1143,7 +1210,7 @@ void Server::destroy() {
     gs->start = 0;
     gs->shutdown = 1;
 
-    if (onShutdown) {
+    if (onShutdown && gs->start_completed) {
         onShutdown(this);
     }
 
@@ -1156,6 +1223,7 @@ void Server::destroy() {
     }
 
     if (is_base_mode()) {
+        get_event_worker_pool()->destroy();
         destroy_base_factory();
     } else if (is_thread_mode()) {
         destroy_thread_factory();
@@ -1168,7 +1236,13 @@ void Server::destroy() {
         destroy_task_workers();
     }
 
+    // Workers contain raw aliases to these owned pipes; release the owner before freeing the alias array.
+    worker_pipes.clear();
+
     sw_shm_free(session_list);
+    for (auto port : ports) {
+        port->gs = nullptr;
+    }
     sw_shm_free(port_gs_list);
     sw_shm_free(workers);
 

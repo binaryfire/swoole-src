@@ -81,11 +81,7 @@ int Server::start_reactor_processes() {
     if (is_single_worker()) {
         Worker *worker = &pool->workers[0];
         SwooleWG.worker = worker;
-        int retval = reactor_process_main_loop(pool, worker);
-        if (retval == SW_OK) {
-            pool->destroy();
-        }
-        return retval;
+        return reactor_process_main_loop(pool, worker);
     }
 
     return start_manager_process();
@@ -242,9 +238,11 @@ int Server::reactor_process_main_loop(ProcessPool *pool, Worker *worker) {
 
     if (worker->id == 0) {
         serv->gs->master_pid = getpid();
-        if (serv->onStart && !serv->gs->onstart_called) {
-            serv->gs->onstart_called = true;
-            serv->onStart(serv);
+        if (!serv->gs->start_completed) {
+            serv->gs->start_completed = true;
+            if (serv->onStart) {
+                serv->onStart(serv);
+            }
         }
     }
 
