@@ -44,12 +44,18 @@ Factory *Server::create_thread_factory() {
     }
     reactor_threads = new ReactorThread[reactor_num]();
     reactor_pipe_num = 1;
+    reactor_thread_barrier.init(false, reactor_num + 1);
+    gs->manager_barrier.init(false, 2);
     return new ThreadFactory(this);
 }
 
-void Server::destroy_thread_factory() const {
+void Server::destroy_thread_factory() {
     sw_free(connection_list);
+    connection_list = nullptr;
     delete[] reactor_threads;
+    reactor_threads = nullptr;
+    reactor_thread_barrier.destroy();
+    gs->manager_barrier.destroy();
 }
 
 ThreadFactory::ThreadFactory(Server *server) : BaseFactory(server) {
@@ -139,7 +145,7 @@ void ThreadFactory::destroy_message_bus() {
     SwooleTG.message_bus = nullptr;
 }
 
-void ThreadFactory::spawn_event_worker(WorkerId i) {
+void ThreadFactory::spawn_event_worker(WorkerId i, bool startup) {
     threads_[i]->start([=]() {
         at_thread_enter(i, SW_EVENT_WORKER);
 
@@ -147,9 +153,30 @@ void ThreadFactory::spawn_event_worker(WorkerId i) {
         worker->type = SW_EVENT_WORKER;
         worker->pid = swoole_get_worker_pid();
         SwooleWG.worker = worker;
-        server_->worker_thread_start(threads_[i], [=]() { Server::reactor_thread_main_loop(server_, i); });
+        ReactorThread *reactor_thread = server_->get_thread(i);
+        reactor_thread->initialized = false;
+        server_->worker_thread_start(
+            threads_[i],
+            [=]() { Server::reactor_thread_main_loop(server_, i, startup); },
+            [reactor_thread]() {
+                reactor_thread->message_bus.clear();
+                reactor_thread->message_bus.free_buffer();
+            });
 
-        at_thread_exit(worker);
+        // A worker callback can unwind past swoole_event_wait() before it releases the thread-local reactor.
+        if (swoole_event_is_available()) {
+            swoole_event_free();
+        }
+        reactor_thread->message_bus.release_pipe_sockets();
+        reactor_thread->pipe_command = nullptr;
+
+        if (startup && !reactor_thread->startup_signalled) {
+            server_->arrive_at_startup_barrier(reactor_thread, true);
+        }
+
+        // Initial failures abort startup through the barrier. Replacement failures must return to the manager so the
+        // worker is reported and respawned, matching process-mode worker supervision.
+        at_thread_exit(!startup || reactor_thread->initialized ? worker : nullptr);
     });
 }
 
@@ -164,15 +191,20 @@ void ThreadFactory::spawn_task_worker(WorkerId i) {
         worker->set_status_to_idle();
         SwooleWG.worker = worker;
         const auto pool = server_->get_task_worker_pool();
-        server_->worker_thread_start(threads_[i], [=]() {
-            if (pool->onWorkerStart != nullptr) {
-                pool->onWorkerStart(pool, worker);
-            }
-            pool->main_loop(pool, worker);
-            if (pool->onWorkerStop != nullptr) {
-                pool->onWorkerStop(pool, worker);
-            }
-        });
+        server_->worker_thread_start(
+            threads_[i],
+            [=]() {
+                if (pool->onWorkerStart != nullptr) {
+                    pool->onWorkerStart(pool, worker);
+                }
+                pool->main_loop(pool, worker);
+                if (pool->onWorkerStop != nullptr) {
+                    pool->onWorkerStop(pool, worker);
+                }
+            },
+            // Task and user buses are allocated before PHP replaces their allocator, so they cannot use the
+            // event-worker cleanup.
+            []() {});
         destroy_message_bus();
 
         at_thread_exit(worker);
@@ -188,7 +220,7 @@ void ThreadFactory::spawn_user_worker(WorkerId i) {
         worker->type = SW_USER_WORKER;
         worker->pid = swoole_get_worker_pid();
         SwooleWG.worker = worker;
-        server_->worker_thread_start(threads_[i], [=]() { server_->onUserWorkerStart(server_, worker); });
+        server_->worker_thread_start(threads_[i], [=]() { server_->onUserWorkerStart(server_, worker); }, []() {});
         destroy_message_bus();
 
         at_thread_exit(worker);
@@ -200,16 +232,27 @@ void ThreadFactory::spawn_manager_thread(WorkerId i) {
         at_thread_enter(i, SW_MANAGER);
 
         swoole_timer_create(true);
+        bool manager_started = false;
 
-        server_->worker_thread_start(threads_[i], [=]() {
-            if (server_->onManagerStart) {
-                server_->onManagerStart(server_);
-            }
-            wait();
-            if (server_->onManagerStop) {
-                server_->onManagerStop(server_);
-            }
-        });
+        server_->worker_thread_start(
+            threads_[i],
+            [=, &manager_started]() {
+                manager_started = true;
+                server_->gs->manager_barrier.wait();
+                if (server_->onManagerStart) {
+                    server_->onManagerStart(server_);
+                }
+                wait();
+                if (server_->onManagerStop) {
+                    server_->onManagerStop(server_);
+                }
+            },
+            []() {});
+
+        if (!manager_started) {
+            server_->gs->manager_start_failed = 1;
+            server_->gs->manager_barrier.wait();
+        }
 
         if (server_->running) {
             swoole_warning("Fatal Error: manager thread exits abnormally");
@@ -275,7 +318,7 @@ void ThreadFactory::wait() {
 
             switch (exited_worker->type) {
             case SW_EVENT_WORKER:
-                spawn_event_worker(exited_worker->id);
+                spawn_event_worker(exited_worker->id, false);
                 break;
             case SW_TASK_WORKER:
                 spawn_task_worker(exited_worker->id);
@@ -385,6 +428,11 @@ WorkerId ThreadFactory::get_master_thread_id() const {
 }
 
 void ThreadFactory::terminate_manager_thread() {
+    auto manager_thread_id = get_manager_thread_id();
+    if (!threads_[manager_thread_id]->joinable()) {
+        return;
+    }
+
     swoole_trace_log(SW_TRACE_THREAD, "notify manager thread to exit");
     push_to_wait_queue(cmd_ptr(CMD_MANAGER_EXIT));
 
@@ -395,7 +443,6 @@ void ThreadFactory::terminate_manager_thread() {
      * which means the management thread might not have reclaimed all worker threads and may have exited prematurely.
      * At this point, it is necessary to loop through and reclaim the remaining worker threads.
      */
-    auto manager_thread_id = get_manager_thread_id();
     threads_[manager_thread_id]->join();
 
     swoole_trace_log(SW_TRACE_THREAD, "manager thread is exited");
@@ -404,6 +451,26 @@ void ThreadFactory::terminate_manager_thread() {
 int Server::start_worker_threads() {
     auto *_factory = dynamic_cast<ThreadFactory *>(factory_);
 
+    if (swoole_event_init(0) < 0) {
+        return abort_start();
+    }
+
+    Reactor *reactor = sw_reactor();
+    for (const auto port : ports) {
+        if (port->is_dgram()) {
+            continue;
+        }
+        if (port->listen() < 0) {
+            return abort_start();
+        }
+        if (reactor->add(port->socket, SW_EVENT_READ) < 0) {
+            return abort_start();
+        }
+    }
+
+    SwooleTG.id = reactor->id = _factory->get_master_thread_id();
+    store_listen_socket();
+
     if (task_worker_num > 0) {
         SW_LOOP_N(task_worker_num) {
             _factory->spawn_task_worker(worker_num + i);
@@ -411,7 +478,8 @@ int Server::start_worker_threads() {
     }
 
     SW_LOOP_N(worker_num) {
-        _factory->spawn_event_worker(i);
+        // The initial event-worker generation participates in the startup rendezvous.
+        _factory->spawn_event_worker(i, true);
     }
 
     if (!user_worker_list.empty()) {
@@ -422,25 +490,6 @@ int Server::start_worker_threads() {
 
     auto manager_thread_id = _factory->get_manager_thread_id();
     _factory->spawn_manager_thread(manager_thread_id);
-
-    if (swoole_event_init(0) < 0) {
-        return SW_ERR;
-    }
-
-    Reactor *reactor = sw_reactor();
-    for (const auto port : ports) {
-        if (port->is_dgram()) {
-            continue;
-        }
-        if (port->listen() < 0) {
-            swoole_event_free();
-            return SW_ERR;
-        }
-        reactor->add(port->socket, SW_EVENT_READ);
-    }
-
-    SwooleTG.id = reactor->id = _factory->get_master_thread_id();
-    store_listen_socket();
 
     return start_master_thread(reactor);
 }

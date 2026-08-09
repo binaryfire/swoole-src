@@ -36,7 +36,8 @@ extern zend_class_entry *swoole_thread_lock_ce;
 extern zend_class_entry *swoole_thread_map_ce;
 extern zend_class_entry *swoole_thread_queue_ce;
 
-void php_swoole_thread_start(std::shared_ptr<swoole::Thread> thread, zend_string *file, ZendArray *argv);
+void php_swoole_thread_start(
+    std::shared_ptr<swoole::Thread> thread, zend_string *file, ZendArray *argv, const std::function<void()> &cleanup);
 void php_swoole_thread_bailout();
 
 ThreadResource *php_swoole_thread_arraylist_cast(const zval *zobject);

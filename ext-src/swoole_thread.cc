@@ -212,7 +212,7 @@ static PHP_METHOD(swoole_thread, __construct) {
     }
 
     try {
-        pt->thread->start([file, argv, pt]() { php_swoole_thread_start(pt->thread, file, argv); });
+        pt->thread->start([file, argv, pt]() { php_swoole_thread_start(pt->thread, file, argv, []() {}); });
     } catch (const std::exception &e) {
         zend_throw_exception(swoole_exception_ce, e.what(), SW_ERROR_SYSTEM_CALL_FAIL);
         return;
@@ -503,7 +503,8 @@ static void thread_register_stdio_file_handles(bool no_close) {
     zend_register_constant(&ec);
 }
 
-void php_swoole_thread_start(std::shared_ptr<Thread> thread, zend_string *file, ZendArray *argv) {
+void php_swoole_thread_start(
+    std::shared_ptr<Thread> thread, zend_string *file, ZendArray *argv, const std::function<void()> &cleanup) {
     thread_num.fetch_add(1);
     thread->enter();
     ts_resource(0);
@@ -557,6 +558,8 @@ void php_swoole_thread_start(std::shared_ptr<Thread> thread, zend_string *file, 
 
     zend_destroy_file_handle(&file_handle);
 
+    // Server worker cleanup must release request-allocated native state before PHP tears down its allocator.
+    cleanup();
     php_request_shutdown(nullptr);
     file_handle.filename = nullptr;
 
