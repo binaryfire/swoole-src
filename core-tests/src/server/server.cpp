@@ -19,6 +19,7 @@
 
 #include "test_core.h"
 
+#include "swoole_api.h"
 #include "swoole_server.h"
 #include "swoole_memory.h"
 #include "swoole_signal.h"
@@ -857,6 +858,47 @@ TEST(server, reload_thread) {
     t1.join();
     ASSERT_EQ(count.load(), serv.get_core_worker_num() * 2);
     test::wait_all_child_processes();
+}
+
+TEST(server, thread_reload_worker_recovers) {
+    Server server(Server::MODE_THREAD);
+    server.worker_num = 1;
+    auto port = server.add_port(SW_SOCK_TCP, TEST_HOST, 0);
+    ASSERT_NE(port, nullptr);
+    ASSERT_EQ(server.create(), SW_OK);
+
+    std::thread client_thread;
+    server.onStart = [&](Server *server) {
+        client_thread = std::thread([&, server]() {
+            ON_SCOPE_EXIT {
+                server->shutdown();
+            };
+
+            network::SyncClient first_client(SW_SOCK_TCP);
+            first_client.get_client()->set_timeout(3, SW_TIMEOUT_READ);
+            ASSERT_TRUE(first_client.connect(TEST_HOST, port->port));
+            ASSERT_EQ(first_client.send(packet, strlen(packet)), strlen(packet));
+            char buffer[1024];
+            ASSERT_EQ(first_client.recv(buffer, sizeof(buffer)), strlen(packet));
+            first_client.close();
+
+            ASSERT_TRUE(server->reload(true));
+            usleep(300000);
+
+            network::SyncClient second_client(SW_SOCK_TCP);
+            second_client.get_client()->set_timeout(3, SW_TIMEOUT_READ);
+            ASSERT_TRUE(second_client.connect(TEST_HOST, port->port));
+            ASSERT_EQ(second_client.send(packet, strlen(packet)), strlen(packet));
+            ASSERT_EQ(second_client.recv(buffer, sizeof(buffer)), strlen(packet));
+        });
+    };
+    server.onReceive = [](Server *server, RecvData *req) -> int {
+        server->send(req->info.fd, req->data, req->info.len);
+        return SW_OK;
+    };
+
+    ASSERT_EQ(server.start(), SW_OK);
+    client_thread.join();
 }
 
 TEST(server, reload_thread_2) {
@@ -2859,6 +2901,379 @@ TEST(server, startup_error) {
 
     ASSERT_EQ(server->start(), -1);
     ASSERT_NE(strstr(server->get_startup_error_message(), "require 'onPacket' callback"), nullptr);
+}
+
+static Server *server_with_invalid_listen_socket = nullptr;
+static bool invalid_listen_socket_hook_registered = false;
+
+class FailingFactory : public BaseFactory {
+  public:
+    explicit FailingFactory(Server *server) : BaseFactory(server) {}
+
+    bool start() override {
+        return false;
+    }
+};
+
+static void invalidate_server_listen_socket(void *ptr) {
+    auto server = static_cast<Server *>(ptr);
+    if (server != server_with_invalid_listen_socket) {
+        return;
+    }
+    server_with_invalid_listen_socket = nullptr;
+
+    int server_fd = server->get_primary_port()->socket->fd;
+    int file_fd = open("/dev/null", O_RDONLY);
+    ASSERT_GE(file_fd, 0);
+    ASSERT_EQ(dup2(file_fd, server_fd), server_fd);
+    ASSERT_EQ(close(file_fd), 0);
+}
+
+static void register_invalid_listen_socket_hook() {
+    if (!invalid_listen_socket_hook_registered) {
+        // Global hooks cannot be removed, so the target keeps this one inert between tests.
+        swoole_add_hook(SW_GLOBAL_HOOK_BEFORE_SERVER_START, invalidate_server_listen_socket, true);
+        invalid_listen_socket_hook_registered = true;
+    }
+}
+
+TEST(server, failed_start_releases_server_state) {
+    register_invalid_listen_socket_hook();
+
+    bool shutdown_called = false;
+    Server server(Server::MODE_PROCESS);
+    server.worker_num = 1;
+    server.reactor_num = 1;
+    ASSERT_NE(server.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    server.onReceive = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onShutdown = [&shutdown_called](Server *server) { shutdown_called = true; };
+    ASSERT_EQ(server.create(), SW_OK);
+
+    server_with_invalid_listen_socket = &server;
+    ON_SCOPE_EXIT {
+        server_with_invalid_listen_socket = nullptr;
+    };
+    ASSERT_EQ(server.start(), SW_ERR);
+
+    ASSERT_TRUE(server.is_shutdown());
+    ASSERT_FALSE(shutdown_called);
+    ASSERT_EQ(SwooleG.server, nullptr);
+    ASSERT_EQ(test::has_child_processes(), 0);
+    ASSERT_TRUE(server.worker_pipes.empty());
+
+    Server next(Server::MODE_PROCESS);
+    next.worker_num = 1;
+    next.reactor_num = 1;
+    ASSERT_NE(next.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    ASSERT_EQ(next.create(), SW_OK);
+    next.destroy();
+}
+
+#ifdef SW_THREAD
+TEST(server, reactor_thread_init_failure_releases_server_state) {
+    register_invalid_listen_socket_hook();
+
+    bool shutdown_called = false;
+    Server server(Server::MODE_THREAD);
+    server.worker_num = 1;
+    server.reactor_num = 1;
+    ASSERT_NE(server.add_port(SW_SOCK_UDP, TEST_HOST, 0), nullptr);
+    server.onPacket = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onShutdown = [&shutdown_called](Server *server) { shutdown_called = true; };
+    ASSERT_EQ(server.create(), SW_OK);
+
+    server_with_invalid_listen_socket = &server;
+    ON_SCOPE_EXIT {
+        server_with_invalid_listen_socket = nullptr;
+    };
+    ASSERT_EQ(server.start(), SW_ERR);
+
+    ASSERT_TRUE(server.is_shutdown());
+    ASSERT_FALSE(shutdown_called);
+    ASSERT_EQ(SwooleG.server, nullptr);
+}
+#endif
+
+TEST(server, factory_start_failure_releases_server_state) {
+    bool shutdown_called = false;
+    Server server(Server::MODE_PROCESS);
+    server.worker_num = 1;
+    server.reactor_num = 1;
+    ASSERT_NE(server.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    server.onReceive = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onShutdown = [&shutdown_called](Server *server) { shutdown_called = true; };
+    ASSERT_EQ(server.create(), SW_OK);
+
+    delete server.factory_;
+    server.factory_ = new FailingFactory(&server);
+
+    ASSERT_EQ(server.start(), SW_ERR);
+    ASSERT_TRUE(server.is_shutdown());
+    ASSERT_FALSE(shutdown_called);
+    ASSERT_EQ(SwooleG.server, nullptr);
+
+    Server next(Server::MODE_PROCESS);
+    next.worker_num = 1;
+    next.reactor_num = 1;
+    ASSERT_NE(next.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    ASSERT_EQ(next.create(), SW_OK);
+    next.destroy();
+}
+
+static void test_manager_start_failure(Server::Mode mode) {
+    bool shutdown_called = false;
+    Server server(mode);
+    server.worker_num = mode == Server::MODE_BASE ? 2 : 1;
+    server.reactor_num = 1;
+    server.task_worker_num = 1;
+    server.task_ipc_mode = Server::TASK_IPC_STREAM;
+    server.pid_file = "/tmp/swoole-server-start-failure-" + std::to_string(getpid()) + "-" +
+                      std::to_string(static_cast<int>(mode)) + ".pid";
+    unlink(server.pid_file.c_str());
+    ON_SCOPE_EXIT {
+        unlink(server.pid_file.c_str());
+    };
+
+    ASSERT_NE(server.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    server.onReceive = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onTask = [](Server *server, EventData *task) -> int { return SW_OK; };
+    server.onShutdown = [&shutdown_called](Server *server) { shutdown_called = true; };
+    ASSERT_EQ(server.create(), SW_OK);
+
+    auto stream_info = server.get_task_worker_pool()->stream_info_;
+    auto task_socket = stream_info->socket;
+    auto task_socket_file_ptr = stream_info->socket_file;
+    stream_info->socket = nullptr;
+    stream_info->socket_file = nullptr;
+    ON_SCOPE_EXIT {
+        task_socket->free();
+        sw_free(task_socket_file_ptr);
+    };
+
+    ASSERT_EQ(server.start(), SW_ERR);
+    ASSERT_TRUE(server.is_shutdown());
+    ASSERT_FALSE(shutdown_called);
+    ASSERT_EQ(access(server.pid_file.c_str(), F_OK), -1);
+    ASSERT_EQ(SwooleG.server, nullptr);
+    ASSERT_EQ(test::has_child_processes(), 0);
+    if (mode == Server::MODE_BASE) {
+#ifndef _WIN32
+        ASSERT_EQ(server.get_event_worker_pool()->pipes, nullptr);
+#endif
+        ASSERT_EQ(server.get_event_worker_pool()->map_, nullptr);
+        ASSERT_EQ(server.get_event_worker_pool()->message_box, nullptr);
+    }
+}
+
+TEST(server, manager_start_failure_releases_server_state_in_base_mode) {
+    test_manager_start_failure(Server::MODE_BASE);
+}
+
+TEST(server, manager_start_failure_releases_server_state_in_process_mode) {
+    test_manager_start_failure(Server::MODE_PROCESS);
+}
+
+#ifdef SW_THREAD
+static void run_worker_and_ignore_runtime_error(std::shared_ptr<Thread>, const WorkerFn &fn, const WorkerFn &cleanup) {
+    ON_SCOPE_EXIT {
+        cleanup();
+    };
+    try {
+        fn();
+    } catch (const std::runtime_error &) {
+    }
+}
+
+TEST(server, thread_single_thread_option) {
+    Server server(Server::MODE_THREAD);
+    server.worker_num = 2;
+    server.single_thread = true;
+    ASSERT_NE(server.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    server.onReceive = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onStart = [](Server *server) { ASSERT_TRUE(server->shutdown()); };
+    ASSERT_EQ(server.create(), SW_OK);
+    ASSERT_EQ(server.start(), SW_OK);
+}
+
+TEST(server, thread_bootstrap_without_worker_entry_releases_server_state) {
+    // A regression leaves the master waiting at the startup barrier, so this test times out rather than reaching its
+    // assertions.
+    bool shutdown_called = false;
+    Server server(Server::MODE_THREAD);
+    server.worker_num = 1;
+    ASSERT_NE(server.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    server.onReceive = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onShutdown = [&shutdown_called](Server *server) { shutdown_called = true; };
+    ASSERT_EQ(server.create(), SW_OK);
+    server.worker_thread_start = [](std::shared_ptr<Thread>, const WorkerFn &fn, const WorkerFn &cleanup) {
+        ON_SCOPE_EXIT {
+            cleanup();
+        };
+        if (swoole_get_worker_type() != SW_EVENT_WORKER) {
+            fn();
+        }
+    };
+
+    ASSERT_EQ(server.start(), SW_ERR);
+    ASSERT_TRUE(server.is_shutdown());
+    ASSERT_FALSE(shutdown_called);
+    ASSERT_EQ(SwooleG.server, nullptr);
+}
+
+TEST(server, thread_manager_bootstrap_without_worker_entry_releases_server_state) {
+    // A regression leaves the master waiting at the startup barrier, so this test times out rather than reaching its
+    // assertions.
+    bool shutdown_called = false;
+    Server server(Server::MODE_THREAD);
+    server.worker_num = 1;
+    ASSERT_NE(server.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    server.onReceive = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onShutdown = [&shutdown_called](Server *server) { shutdown_called = true; };
+    ASSERT_EQ(server.create(), SW_OK);
+    server.worker_thread_start = [](std::shared_ptr<Thread>, const WorkerFn &fn, const WorkerFn &cleanup) {
+        ON_SCOPE_EXIT {
+            cleanup();
+        };
+        if (swoole_get_worker_type() != SW_MANAGER) {
+            fn();
+        }
+    };
+
+    ASSERT_EQ(server.start(), SW_ERR);
+    ASSERT_TRUE(server.is_shutdown());
+    ASSERT_FALSE(shutdown_called);
+    ASSERT_EQ(SwooleG.server, nullptr);
+}
+
+TEST(server, thread_bootstrap_unwind_releases_server_state) {
+    bool shutdown_called = false;
+    Server server(Server::MODE_THREAD);
+    server.worker_num = 1;
+    ASSERT_NE(server.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    server.onReceive = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onWorkerStart = [](Server *server, Worker *worker) { throw std::runtime_error("bootstrap unwound"); };
+    server.onShutdown = [&shutdown_called](Server *server) { shutdown_called = true; };
+    ASSERT_EQ(server.create(), SW_OK);
+    server.worker_thread_start = run_worker_and_ignore_runtime_error;
+
+    ASSERT_EQ(server.start(), SW_ERR);
+    ASSERT_TRUE(server.is_shutdown());
+    ASSERT_FALSE(shutdown_called);
+    ASSERT_EQ(SwooleG.server, nullptr);
+}
+
+TEST(server, thread_worker_unwind_after_start_is_replaced) {
+    Server server(Server::MODE_THREAD);
+    server.worker_num = 1;
+    auto port = server.add_port(SW_SOCK_TCP, TEST_HOST, 0);
+    ASSERT_NE(port, nullptr);
+    ASSERT_EQ(server.create(), SW_OK);
+
+    std::atomic<uint32_t> event_worker_bootstrap_count{0};
+    std::atomic<uint32_t> receive_count{0};
+    std::thread client_thread;
+    server.worker_thread_start = [&](std::shared_ptr<Thread>, const WorkerFn &fn, const WorkerFn &cleanup) {
+        ON_SCOPE_EXIT {
+            cleanup();
+        };
+        if (swoole_get_worker_type() == SW_EVENT_WORKER && event_worker_bootstrap_count.fetch_add(1) == 1) {
+            return;
+        }
+        try {
+            fn();
+        } catch (const std::runtime_error &) {
+        }
+    };
+    server.onStart = [&](Server *server) {
+        client_thread = std::thread([&, server]() {
+            ON_SCOPE_EXIT {
+                server->shutdown();
+            };
+
+            network::SyncClient first_client(SW_SOCK_TCP);
+            ASSERT_TRUE(first_client.connect(TEST_HOST, port->port));
+            ASSERT_EQ(first_client.send(packet, strlen(packet)), strlen(packet));
+            first_client.close();
+
+            for (int i = 0; receive_count.load() == 0 && i < 3000; i++) {
+                usleep(1000);
+            }
+            ASSERT_EQ(receive_count.load(), 1);
+
+            network::SyncClient second_client(SW_SOCK_TCP);
+            second_client.get_client()->set_timeout(3, SW_TIMEOUT_READ);
+            ASSERT_TRUE(second_client.connect(TEST_HOST, port->port));
+            ASSERT_EQ(second_client.send(packet, strlen(packet)), strlen(packet));
+            char buffer[1024];
+            ASSERT_EQ(second_client.recv(buffer, sizeof(buffer)), strlen(packet));
+        });
+    };
+    server.onReceive = [&receive_count](Server *server, RecvData *req) -> int {
+        if (receive_count.fetch_add(1) == 0) {
+            throw std::runtime_error("worker unwound");
+        }
+        server->send(req->info.fd, req->data, req->info.len);
+        return SW_OK;
+    };
+
+    ASSERT_EQ(server.start(), SW_OK);
+    client_thread.join();
+    ASSERT_EQ(event_worker_bootstrap_count.load(), 3);
+    ASSERT_EQ(receive_count.load(), 2);
+}
+#endif
+
+TEST(server, base_event_worker_pool_released_after_shutdown) {
+    Server server(Server::MODE_BASE);
+    server.worker_num = 2;
+    ASSERT_NE(server.add_port(SW_SOCK_TCP, TEST_HOST, 0), nullptr);
+    server.onReceive = [](Server *server, RecvData *req) -> int { return SW_OK; };
+    server.onWorkerStart = [](Server *server, Worker *worker) {
+        if (worker->id == 0) {
+            swoole_timer_after(10, [server](TIMER_PARAMS) { server->shutdown(); });
+        }
+    };
+    ASSERT_EQ(server.create(), SW_OK);
+    ASSERT_EQ(server.start(), SW_OK);
+
+#ifndef _WIN32
+    ASSERT_EQ(server.get_event_worker_pool()->pipes, nullptr);
+#endif
+    ASSERT_EQ(server.get_event_worker_pool()->map_, nullptr);
+    ASSERT_EQ(server.get_event_worker_pool()->message_box, nullptr);
+    ASSERT_EQ(test::has_child_processes(), 0);
+}
+
+TEST(server, failed_create_releases_server_state) {
+    Server server(Server::MODE_PROCESS);
+    server.worker_num = 1;
+    server.reactor_num = 1;
+    server.task_worker_num = 1;
+    server.task_ipc_mode = Server::TASK_IPC_STREAM;
+    auto port = server.add_port(SW_SOCK_TCP, TEST_HOST, 0);
+    ASSERT_NE(port, nullptr);
+
+    // The task socket path is pid-scoped so parallel test processes do not collide.
+    std::string socket_file = "/tmp/swoole.task." + std::to_string(getpid()) + ".sock";
+    unlink(socket_file.c_str());
+    ON_SCOPE_EXIT {
+        unlink(socket_file.c_str());
+    };
+
+    int file_fd = open(socket_file.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+    ASSERT_GE(file_fd, 0);
+    ASSERT_EQ(close(file_fd), 0);
+
+    ASSERT_EQ(server.create(), SW_ERR);
+    ASSERT_EQ(access(socket_file.c_str(), F_OK), 0);
+    ASSERT_EQ(server.factory_, nullptr);
+    ASSERT_EQ(server.workers, nullptr);
+    ASSERT_EQ(port->gs, nullptr);
+
+    ASSERT_EQ(unlink(socket_file.c_str()), 0);
+    ASSERT_EQ(server.create(), SW_OK);
+    server.destroy();
+    ASSERT_EQ(access(socket_file.c_str(), F_OK), -1);
 }
 
 TEST(server, abort_worker) {
