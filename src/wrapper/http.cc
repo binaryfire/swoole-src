@@ -79,15 +79,27 @@ static  constexpr multipart_parser_settings mt_parser_settings = {
 
 struct ContextImpl {
     llhttp_t parser;
-    multipart_parser *mt_parser;
+    multipart_parser *mt_parser = nullptr;
 
     std::string current_header_name;
     std::string current_form_data_name;
     bool current_part_is_file = false;
-    String *form_data_buffer;
+    bool upload_preprocessed = false;
+    String *form_data_buffer = nullptr;
 
     bool completed = false;
     bool is_beginning = true;
+
+    ~ContextImpl() {
+        if (mt_parser) {
+            if (mt_parser->fp) {
+                fclose(mt_parser->fp);
+                mt_parser->fp = nullptr;
+            }
+            multipart_parser_free(mt_parser);
+        }
+        delete form_data_buffer;
+    }
 
     bool parse(Context &ctx, const char *at, size_t length) {
         swoole_llhttp_parser_init(&parser, HTTP_REQUEST, static_cast<void *>(&ctx));
@@ -137,6 +149,9 @@ static int http_request_on_header_value(llhttp_t *parser, const char *at, size_t
                 return -1;
             }
             impl->mt_parser = multipart_parser_init(boundary_str, boundary_len, &mt_parser_settings);
+            if (impl->mt_parser == nullptr) {
+                return -1;
+            }
             impl->form_data_buffer = new String(SW_BUFFER_SIZE_STD);
             impl->mt_parser->data = ctx;
             swoole_trace_log(SW_TRACE_HTTP, "form_data, boundary_str=%s", boundary_str);
@@ -219,14 +234,16 @@ static int multipart_body_on_header_value(multipart_parser *p, const char *at, s
         } else {
             impl->current_part_is_file = true;
         }
-    } else if (SW_STRCASEEQ(header_name, header_len, SW_HTTP_UPLOAD_FILE)) {
+    } else if (SW_STRCASEEQ(header_name, header_len, SW_HTTP_UPLOAD_FILE) && impl->upload_preprocessed) {
         /**
-         * When the "SW_HTTP_UPLOAD_FILE" header appears in the request, it indicates that the uploaded file has been
-         * saved in a temporary file. The binary content in the message body will be replaced with the temporary
-         * filename. However, the Content-Length still reflects the original message size, causing llhttp to believe
-         * there is still data to be received. As a result, llhttp fails to trigger the message callback. Therefore, we
-         * need to set `ctx->completed = 1` to indicate that the message processing is complete.
+         * Preprocessed upload bodies replace file content with a temporary file path. The original Content-Length
+         * remains, so mark the request completed after consuming the generated marker.
          */
+        if (impl->current_form_data_name.empty()) {
+            std::string tmp_file(at, length);
+            unlink(tmp_file.c_str());
+            return -1;
+        }
         impl->completed = true;
         ctx->files[impl->current_form_data_name] = std::string(at, length);
     }
@@ -312,11 +329,6 @@ static int http_request_message_complete(llhttp_t *p) {
     const auto *ctx = static_cast<Context *>(p->data);
     auto *impl = ctx->impl;
 
-    if (impl->form_data_buffer) {
-        delete impl->form_data_buffer;
-        impl->form_data_buffer = nullptr;
-    }
-
     impl->completed = true;
     return HPE_PAUSED;
 }
@@ -388,6 +400,7 @@ std::shared_ptr<Server> listen(const std::string &addr, const std::function<void
             return SW_OK;
         }
         ContextImpl impl;
+        impl.upload_preprocessed = (req->info.ext_flags & SW_HTTP_EXT_FLAG_UPLOAD_PREPROCESSED) != 0;
         Context ctx(server, session_id, &impl);
         if (impl.parse(ctx, req->data, req->info.len)) {
             http_server_on_request(ctx);

@@ -667,6 +667,7 @@ struct DataHead {
     uint8_t type;
     uint8_t flags;
     uint16_t server_fd;
+    // Extra protocol-specific flags.
     uint16_t ext_flags;
     uint32_t reserved;
     double time;

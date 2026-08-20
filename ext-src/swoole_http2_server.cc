@@ -1113,7 +1113,9 @@ static int http2_server_parse_header(
                                 (char *) nv.value, nv.valuelen, offset, &boundary_str, &boundary_len)) {
                             return SW_ERR;
                         }
-                        ctx->init_multipart_parser(boundary_str, boundary_len);
+                        if (!ctx->init_multipart_parser(boundary_str, boundary_len)) {
+                            return SW_ERR;
+                        }
                         ctx->parser.data = ctx;
                     }
                 } else if (SW_STRCASEEQ((char *) nv.name, nv.namelen, "cookie")) {

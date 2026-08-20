@@ -112,6 +112,10 @@ namespace swoole {
 class Server;
 namespace http_server {
 //-----------------------------------------------------------------
+enum {
+    SW_HTTP_EXT_FLAG_UPLOAD_PREPROCESSED = 1u << 0,
+};
+
 struct FormData {
     const char *multipart_boundary_buf;
     uint32_t multipart_boundary_len;
@@ -119,8 +123,7 @@ struct FormData {
     String *multipart_buffer_;
     String *upload_tmpfile;
     std::string upload_tmpfile_fmt_;
-    const char *current_header_name;
-    size_t current_header_name_len;
+    std::string current_header_name;
     size_t upload_filesize;
     size_t upload_max_filesize;
 };
@@ -135,6 +138,7 @@ struct Request {
     uchar header_parsed : 1;
     uchar tried_to_dispatch : 1;
     uchar multipart_header_parsed : 1;
+    uchar upload_preprocessed : 1;
 
     uchar known_length : 1;
     uchar keep_alive : 1;

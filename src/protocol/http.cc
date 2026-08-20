@@ -151,8 +151,7 @@ namespace http_server {
 
 static int multipart_on_header_field(multipart_parser *p, const char *at, size_t length) {
     auto *request = static_cast<Request *>(p->data);
-    request->form_data_->current_header_name = at;
-    request->form_data_->current_header_name_len = length;
+    request->form_data_->current_header_name.assign(at, length);
 
     swoole_trace("header_field: at=%.*s, length=%lu", (int) length, at, length);
     return 0;
@@ -163,13 +162,21 @@ static int multipart_on_header_value(multipart_parser *p, const char *at, size_t
 
     auto *request = static_cast<Request *>(p->data);
     auto *form_data = request->form_data_;
+    const auto &header_name = form_data->current_header_name;
 
-    form_data->multipart_buffer_->append(form_data->current_header_name, form_data->current_header_name_len);
+    // Drop any client-supplied copy of the marker; the preprocessor appends its own after saving a file part.
+    // The rebuilt body is re-parsed by this same tokenizer, and both consumers match the name with the same
+    // exact-length case-insensitive compare, so nothing the client writes can reach them as a second marker.
+    if (SW_STRCASEEQ(header_name.c_str(), header_name.length(), SW_HTTP_UPLOAD_FILE)) {
+        return 0;
+    }
+
+    form_data->multipart_buffer_->append(header_name.c_str(), header_name.length());
     form_data->multipart_buffer_->append(SW_STRL(": "));
     form_data->multipart_buffer_->append(at, length);
     form_data->multipart_buffer_->append(SW_STRL("\r\n"));
 
-    if (SW_STRCASEEQ(form_data->current_header_name, form_data->current_header_name_len, "content-disposition")) {
+    if (SW_STRCASEEQ(header_name.c_str(), header_name.length(), "content-disposition")) {
         ParseCookieCallback cb = [request, form_data, p](char *key, size_t key_len, char *value, size_t value_len) {
             if (SW_STRCASEEQ(key, key_len, "filename")) {
                 memcpy(form_data->upload_tmpfile->str,
@@ -786,12 +793,16 @@ bool Request::init_multipart_parser(const Server *server) {
     int boundary_len;
     if (!parse_multipart_boundary(
             form_data_->multipart_boundary_buf, form_data_->multipart_boundary_len, 0, &boundary_str, &boundary_len)) {
+        delete form_data_;
+        form_data_ = nullptr;
         return false;
     }
 
     form_data_->multipart_parser_ = multipart_parser_init(boundary_str, boundary_len, &mt_parser_settings);
     if (!form_data_->multipart_parser_) {
         swoole_warning("multipart_parser_init() failed");
+        delete form_data_;
+        form_data_ = nullptr;
         return false;
     }
     form_data_->multipart_parser_->data = this;
@@ -804,9 +815,12 @@ bool Request::init_multipart_parser(const Server *server) {
     form_data_->upload_tmpfile_fmt_ = server->upload_tmp_dir + "/swoole.upfile.XXXXXX";
     form_data_->upload_tmpfile = new String(form_data_->upload_tmpfile_fmt_);
     form_data_->upload_max_filesize = server->upload_max_filesize;
-#endif  // _WIN32
-
     return true;
+#else
+    delete form_data_;
+    form_data_ = nullptr;
+    return false;
+#endif  // _WIN32
 }
 
 void Request::destroy_multipart_parser() {
